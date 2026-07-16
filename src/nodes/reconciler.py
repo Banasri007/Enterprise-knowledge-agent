@@ -55,7 +55,7 @@ def reconciler_node(state: AgentState) -> dict:
     docs_text = _format_evidence(ranked, "docs")
     github_text = _format_evidence(ranked, "github")
 
-    llm = get_llm()
+    llm = get_llm(fast=True)
     response = llm.invoke(
         [
             SystemMessage(content=RECONCILE_SYSTEM),
