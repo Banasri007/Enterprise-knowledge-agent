@@ -3,11 +3,11 @@
 from __future__ import annotations
 
 import os
-from functools import lru_cache
 from pathlib import Path
 from typing import Any
 
 import chromadb
+import streamlit as st
 from chromadb.config import Settings
 from langchain_huggingface import HuggingFaceEmbeddings
 from langchain_text_splitters import RecursiveCharacterTextSplitter
@@ -17,18 +17,22 @@ DOCS_COLLECTION = "docs_corpus"
 GITHUB_COLLECTION = "github_history"
 
 
-@lru_cache(maxsize=1)
+@st.cache_resource(show_spinner="Loading embedding model (first run only)...")
 def get_embeddings() -> HuggingFaceEmbeddings:
     """Local sentence-transformer embeddings (Groq has no embedding API).
 
-    Cached so the model is loaded from disk once per process instead of
-    on every single embed call — this was the main ingestion slowdown.
+    Uses st.cache_resource instead of functools.lru_cache: a plain
+    lru_cache on a module-level function isn't reliably preserved across
+    Streamlit's dev-mode file-watcher reruns, so the ~90MB model could
+    silently get reloaded from disk on reruns that shouldn't have touched
+    it. st.cache_resource is Streamlit's purpose-built fix for exactly
+    this (models, DB connections) and survives reruns properly.
     """
     model = os.getenv("EMBEDDING_MODEL", "all-MiniLM-L6-v2")
     return HuggingFaceEmbeddings(model_name=model)
 
 
-@lru_cache(maxsize=1)
+@st.cache_resource
 def get_chroma_client() -> chromadb.ClientAPI:
     """Persistent local Chroma client, cached per process."""
     CHROMA_DIR.mkdir(parents=True, exist_ok=True)
