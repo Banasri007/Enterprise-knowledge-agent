@@ -53,7 +53,7 @@ def _grade_evidence(question: str, items: list[EvidenceItem]) -> SourceGrade:
         f"[{i}] ({e.citation_label}): {e.content[:500]}"
         for i, e in enumerate(items)
     )
-    llm = get_llm()
+    llm = get_llm(fast=True)
     response = llm.invoke(
         [
             SystemMessage(content=GROUNDING_SYSTEM),
