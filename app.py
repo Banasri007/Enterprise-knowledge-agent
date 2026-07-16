@@ -90,6 +90,11 @@ if page == "Setup":
             st.error("GROQ_API_KEY is required. Copy `.env.example` to `.env` and add your key.")
             st.stop()
 
+        # Show feedback before the slow part: importing chromadb/transformers/
+        # sentence-transformers can take 20-40s the first time in a process,
+        # and used to happen silently before the progress bar even existed.
+        progress = st.progress(0, text="Loading libraries (first run only)...")
+
         from src.ingestion.docs_ingestion import (
             index_doc_chunks,
             ingest_doc_bytes,
@@ -99,9 +104,15 @@ if page == "Setup":
         from src.ingestion.sample_data import load_sample_github_items
         from src.utils.vector_store import reset_collections
 
-        progress = st.progress(0, text="Resetting vector store...")
+        progress.progress(5, text="Resetting vector store...")
         reset_collections()
-        progress.progress(10, text="Processing documents...")
+
+        progress.progress(10, text="Loading embedding model (first run only, ~1-2 min)...")
+        from src.utils.vector_store import get_embeddings
+
+        get_embeddings()  # force load/download now so it's not hidden inside chunk indexing below
+
+        progress.progress(25, text="Processing documents...")
 
         doc_chunks = []
         doc_file_count = 0
