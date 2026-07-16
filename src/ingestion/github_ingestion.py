@@ -6,6 +6,7 @@ from __future__ import annotations
 import base64
 import os
 import re
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timezone
 
 import httpx
@@ -35,6 +36,15 @@ REPO_FILE_EXTENSIONS = {
 }
 SKIP_PATH_SEGMENTS = {"node_modules", ".git", "bin", "obj", "dist", "build", ".venv"}
 
+# Per-item fetches (commit diffs, PR files, comments, repo file contents) are
+# each a separate HTTP call. Running them one at a time was the main source
+# of slowness (100+ sequential round trips). This bounds how many run at once.
+MAX_WORKERS = 8
+
+
+class GitHubRateLimitError(RuntimeError):
+    """Raised when the GitHub API rate limit is exhausted mid-ingestion."""
+
 
 def _parse_repo_url(repo_url: str) -> tuple[str, str]:
     """Extract owner/repo from a GitHub URL."""
@@ -60,6 +70,37 @@ def _headers() -> dict[str, str]:
     return headers
 
 
+def _check_rate_limit(client: httpx.Client, min_needed: int = 40) -> None:
+    """Fail fast with a clear error instead of silently losing data to 403s
+    partway through ingestion. Unauthenticated requests get 60/hour; this
+    pipeline can easily need 100-150+ calls for a repo with real history."""
+    try:
+        resp = client.get(f"{GITHUB_API}/rate_limit")
+        resp.raise_for_status()
+        core = resp.json().get("resources", {}).get("core", {})
+        remaining = core.get("remaining", 0)
+        limit = core.get("limit", 60)
+    except httpx.HTTPError:
+        return  # don't block ingestion just because the rate-limit check itself failed
+
+    if remaining < min_needed:
+        reset_ts = core.get("reset")
+        reset_str = (
+            datetime.fromtimestamp(reset_ts, tz=timezone.utc).strftime("%H:%M UTC")
+            if reset_ts
+            else "later"
+        )
+        hint = (
+            "Add a GITHUB_TOKEN to raise your limit to 5000/hour."
+            if limit <= 60
+            else "Wait for the limit to reset."
+        )
+        raise GitHubRateLimitError(
+            f"Only {remaining}/{limit} GitHub API requests remaining (resets ~{reset_str}). "
+            f"This repo ingestion needs ~{min_needed}+ requests. {hint}"
+        )
+
+
 def _get_paginated(client: httpx.Client, url: str, max_pages: int = 5) -> list[dict]:
     items: list[dict] = []
     page_url: str | None = url
@@ -71,6 +112,25 @@ def _get_paginated(client: httpx.Client, url: str, max_pages: int = 5) -> list[d
         page_url = resp.links.get("next", {}).get("url")
         pages += 1
     return items
+
+
+def _run_parallel(fetch_fn, work_items: list, max_workers: int = MAX_WORKERS) -> list:
+    """Run fetch_fn(item) over work_items concurrently, preserving order.
+    A single slow/failed item no longer stalls or silently drops the rest."""
+    if not work_items:
+        return []
+    results: list = [None] * len(work_items)
+    with ThreadPoolExecutor(max_workers=max_workers) as pool:
+        future_to_idx = {pool.submit(fetch_fn, item): i for i, item in enumerate(work_items)}
+        for future in as_completed(future_to_idx):
+            idx = future_to_idx[future]
+            try:
+                results[idx] = future.result()
+            except GitHubRateLimitError:
+                raise
+            except Exception:
+                results[idx] = None
+    return results
 
 
 def _format_files(files: list[dict]) -> list[str]:
@@ -87,12 +147,22 @@ def _format_files(files: list[dict]) -> list[str]:
     return out
 
 
+def _raise_if_rate_limited(resp: httpx.Response) -> None:
+    if resp.status_code == 403 and resp.headers.get("X-RateLimit-Remaining") == "0":
+        raise GitHubRateLimitError(
+            "GitHub API rate limit hit mid-ingestion. Add a GITHUB_TOKEN and retry."
+        )
+
+
 def _fetch_commit_files(client: httpx.Client, owner: str, repo: str, sha: str) -> list[str]:
     """Fetch the file diff for a single commit (one extra API call each)."""
     try:
         resp = client.get(f"{GITHUB_API}/repos/{owner}/{repo}/commits/{sha}")
+        _raise_if_rate_limited(resp)
         resp.raise_for_status()
         return _format_files(resp.json().get("files", []))
+    except GitHubRateLimitError:
+        raise
     except httpx.HTTPError:
         return []
 
@@ -100,8 +170,11 @@ def _fetch_commit_files(client: httpx.Client, owner: str, repo: str, sha: str) -
 def _fetch_pr_files(client: httpx.Client, owner: str, repo: str, number: int) -> list[str]:
     try:
         resp = client.get(f"{GITHUB_API}/repos/{owner}/{repo}/pulls/{number}/files")
+        _raise_if_rate_limited(resp)
         resp.raise_for_status()
         return _format_files(resp.json())
+    except GitHubRateLimitError:
+        raise
     except httpx.HTTPError:
         return []
 
@@ -111,8 +184,11 @@ def _fetch_comments(client: httpx.Client, owner: str, repo: str, number: int) ->
     try:
         url = f"{GITHUB_API}/repos/{owner}/{repo}/issues/{number}/comments?per_page={MAX_COMMENTS_PER_THREAD}"
         resp = client.get(url)
+        _raise_if_rate_limited(resp)
         resp.raise_for_status()
         return resp.json()[:MAX_COMMENTS_PER_THREAD]
+    except GitHubRateLimitError:
+        raise
     except httpx.HTTPError:
         return []
 
@@ -122,15 +198,19 @@ def fetch_commits(
 ) -> list[GitHubItem]:
     url = f"{GITHUB_API}/repos/{owner}/{repo}/commits?per_page=30"
     raw = _get_paginated(client, url, max_pages=3)[:limit]
+
+    diff_targets = raw[:MAX_COMMITS_WITH_DIFF]
+    diffs = _run_parallel(
+        lambda c: _fetch_commit_files(client, owner, repo, c.get("sha", "")), diff_targets
+    )
+    files_by_sha = {c.get("sha", ""): d for c, d in zip(diff_targets, diffs)}
+
     items: list[GitHubItem] = []
-    for i, c in enumerate(raw):
+    for c in raw:
         commit = c.get("commit", {})
         msg = commit.get("message", "")
         ts = commit.get("author", {}).get("date") or commit.get("committer", {}).get("date")
         sha = c.get("sha", "")
-        files_changed = (
-            _fetch_commit_files(client, owner, repo, sha) if i < MAX_COMMITS_WITH_DIFF else []
-        )
         items.append(
             GitHubItem(
                 item_type="commit",
@@ -142,7 +222,7 @@ def fetch_commits(
                 if ts
                 else datetime.now(timezone.utc),
                 url=c.get("html_url", ""),
-                files_changed=files_changed,
+                files_changed=files_by_sha.get(sha) or [],
             )
         )
     return items
@@ -154,9 +234,14 @@ def fetch_pull_requests(
     """Returns (prs, pr_comments)."""
     url = f"{GITHUB_API}/repos/{owner}/{repo}/pulls?state=all&per_page=20"
     raw = _get_paginated(client, url, max_pages=2)[:limit]
+
+    numbers = [pr.get("number") for pr in raw]
+    files_lists = _run_parallel(lambda n: _fetch_pr_files(client, owner, repo, n), numbers)
+    comments_lists = _run_parallel(lambda n: _fetch_comments(client, owner, repo, n), numbers)
+
     prs: list[GitHubItem] = []
     comments: list[GitHubItem] = []
-    for pr in raw:
+    for pr, files, raw_comments in zip(raw, files_lists, comments_lists):
         number = pr.get("number")
         merged = pr.get("merged_at")
         ts = merged or pr.get("created_at")
@@ -171,12 +256,10 @@ def fetch_pull_requests(
                 if ts
                 else datetime.now(timezone.utc),
                 url=pr.get("html_url", ""),
-                files_changed=_fetch_pr_files(client, owner, repo, number),
+                files_changed=files or [],
             )
         )
-        comments.extend(
-            _comments_to_items(_fetch_comments(client, owner, repo, number), pr_number=number)
-        )
+        comments.extend(_comments_to_items(raw_comments or [], pr_number=number))
     return prs, comments
 
 
@@ -189,9 +272,12 @@ def fetch_issues(
     raw = _get_paginated(client, url, max_pages=3)
     raw = [i for i in raw if "pull_request" not in i][:limit]
 
+    numbers = [issue.get("number") for issue in raw]
+    comments_lists = _run_parallel(lambda n: _fetch_comments(client, owner, repo, n), numbers)
+
     issues: list[GitHubItem] = []
     comments: list[GitHubItem] = []
-    for issue in raw:
+    for issue, raw_comments in zip(raw, comments_lists):
         number = issue.get("number")
         ts = issue.get("created_at")
         issues.append(
@@ -207,9 +293,7 @@ def fetch_issues(
                 url=issue.get("html_url", ""),
             )
         )
-        comments.extend(
-            _comments_to_items(_fetch_comments(client, owner, repo, number), issue_number=number)
-        )
+        comments.extend(_comments_to_items(raw_comments or [], issue_number=number))
     return issues, comments
 
 
@@ -247,6 +331,33 @@ def _get_default_branch(client: httpx.Client, owner: str, repo: str) -> str:
     return resp.json().get("default_branch", "main")
 
 
+def _fetch_file_content(
+    client: httpx.Client, owner: str, repo: str, branch: str, path: str
+) -> GitHubItem | None:
+    try:
+        resp = client.get(f"{GITHUB_API}/repos/{owner}/{repo}/contents/{path}?ref={branch}")
+        _raise_if_rate_limited(resp)
+        resp.raise_for_status()
+        data = resp.json()
+        if data.get("encoding") != "base64":
+            return None
+        content = base64.b64decode(data["content"]).decode("utf-8", errors="replace")
+    except GitHubRateLimitError:
+        raise
+    except (httpx.HTTPError, KeyError, ValueError):
+        return None
+
+    return GitHubItem(
+        item_type="file",
+        file_path=path,
+        title=path,
+        body=content,
+        author=owner,
+        timestamp=datetime.now(timezone.utc),
+        url=data.get("html_url", f"https://github.com/{owner}/{repo}/blob/{branch}/{path}"),
+    )
+
+
 def fetch_repo_files(client: httpx.Client, owner: str, repo: str) -> list[GitHubItem]:
     """Fetch actual repo file contents (README, source, docs, etc.) via the
     Git Trees + Contents API. This is what lets the KB answer questions
@@ -281,31 +392,10 @@ def fetch_repo_files(client: httpx.Client, owner: str, repo: str) -> list[GitHub
     candidates.sort(key=lambda e: (0 if "readme" in e["path"].lower() else 1, e["path"].count("/")))
     candidates = candidates[:MAX_REPO_FILES]
 
-    items: list[GitHubItem] = []
-    for entry in candidates:
-        path = entry["path"]
-        try:
-            resp = client.get(f"{GITHUB_API}/repos/{owner}/{repo}/contents/{path}?ref={branch}")
-            resp.raise_for_status()
-            data = resp.json()
-            if data.get("encoding") != "base64":
-                continue
-            content = base64.b64decode(data["content"]).decode("utf-8", errors="replace")
-        except (httpx.HTTPError, KeyError, ValueError):
-            continue
-
-        items.append(
-            GitHubItem(
-                item_type="file",
-                file_path=path,
-                title=path,
-                body=content,
-                author=owner,
-                timestamp=datetime.now(timezone.utc),
-                url=data.get("html_url", f"https://github.com/{owner}/{repo}/blob/{branch}/{path}"),
-            )
-        )
-    return items
+    fetched = _run_parallel(
+        lambda entry: _fetch_file_content(client, owner, repo, branch, entry["path"]), candidates
+    )
+    return [item for item in fetched if item is not None]
 
 
 def fetch_github_history(repo_url: str) -> list[GitHubItem]:
@@ -313,6 +403,7 @@ def fetch_github_history(repo_url: str) -> list[GitHubItem]:
     PRs (+diffs +comments), and issues (+comments)."""
     owner, repo = _parse_repo_url(repo_url)
     with httpx.Client(timeout=30.0, headers=_headers()) as client:
+        _check_rate_limit(client)
         files = fetch_repo_files(client, owner, repo)
         commits = fetch_commits(client, owner, repo)
         prs, pr_comments = fetch_pull_requests(client, owner, repo)
