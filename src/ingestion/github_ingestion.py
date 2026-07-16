@@ -1,121 +1,410 @@
-"""Pydantic models for evidence, grading, and citations."""
+"""GitHub history ingestion via GitHub API — commits (with diffs), PRs
+(with diffs), issues, and comments."""
 
 from __future__ import annotations
 
-from datetime import datetime
-from typing import Literal
+import base64
+import os
+import re
+from datetime import datetime, timezone
 
-from pydantic import BaseModel, Field
+import httpx
 
+from src.models.schemas import GitHubItem
+from src.utils.vector_store import GITHUB_COLLECTION, add_to_collection, get_text_splitter
 
-class EvidenceItem(BaseModel):
-    """A single retrieved piece of evidence from docs or GitHub."""
+GITHUB_API = "https://api.github.com"
 
-    source_type: Literal["docs", "github"]
-    content: str
-    metadata: dict = Field(default_factory=dict)
-    vector_score: float = 0.0
-    grounding_score: float = 0.0
-    relevance_score: float = 0.0
-    recency_score: float = 0.0
-    authority_score: float = 0.0
-    composite_score: float = 0.0
-
-    @property
-    def citation_label(self) -> str:
-        if self.source_type == "docs":
-            doc_name = self.metadata.get("doc_name", "unknown-doc")
-            section = self.metadata.get("section", "")
-            return f"{doc_name}" + (f" §{section}" if section else "")
-        item_type = self.metadata.get("item_type", "commit")
-        if item_type == "pr":
-            return f"PR #{self.metadata.get('pr_number', '?')}"
-        if item_type == "issue":
-            return f"Issue #{self.metadata.get('issue_number', '?')}"
-        if item_type == "comment":
-            parent = self.metadata.get("pr_number") or self.metadata.get("issue_number")
-            return f"Comment on #{parent}"
-        if item_type == "file":
-            return self.metadata.get("file_path", "repo file")
-        return f"commit {self.metadata.get('sha', '?')[:7]}"
-
-    @property
-    def citation_url(self) -> str | None:
-        if self.source_type == "github":
-            return self.metadata.get("url")
-        return None
+# Bounds to keep ingestion time and API-rate-limit usage reasonable.
+# Raise these if you have a GITHUB_TOKEN (5000 req/hr vs 60 unauthenticated).
+MAX_COMMITS = 50
+MAX_COMMITS_WITH_DIFF = 15
+MAX_PRS = 20
+MAX_ISSUES = 30
+MAX_COMMENTS_PER_THREAD = 5
+MAX_FILES_PER_ITEM = 5
+PATCH_CHAR_LIMIT = 800
+COMMENT_CHAR_LIMIT = 500
+MAX_REPO_FILES = 60
+MAX_FILE_BYTES = 40_000
+REPO_FILE_EXTENSIONS = {
+    ".md", ".txt", ".rst", ".html", ".htm",
+    ".cs", ".cshtml", ".razor", ".py", ".js", ".ts", ".tsx", ".jsx",
+    ".java", ".go", ".rb", ".php", ".json", ".yml", ".yaml", ".xml",
+    ".sql", ".pli", ".pl1", ".cbl", ".cob",
+}
+SKIP_PATH_SEGMENTS = {"node_modules", ".git", "bin", "obj", "dist", "build", ".venv"}
 
 
-class SourceGrade(BaseModel):
-    """Grounding/relevance grade for a single source's retrieval batch."""
-
-    source_type: Literal["docs", "github"]
-    is_grounded: bool
-    is_relevant: bool
-    confidence: float = Field(ge=0.0, le=1.0)
-    reasoning: str
-    evidence_count: int = 0
-
-
-class ConflictDetail(BaseModel):
-    """Describes disagreement between docs and GitHub evidence."""
-
-    topic: str
-    docs_perspective: str
-    github_perspective: str
-    docs_citations: list[str] = Field(default_factory=list)
-    github_citations: list[str] = Field(default_factory=list)
-    resolution_note: str = ""
+def _parse_repo_url(repo_url: str) -> tuple[str, str]:
+    """Extract owner/repo from a GitHub URL."""
+    patterns = [
+        r"github\.com/([^/]+)/([^/\.]+)",
+        r"^([^/]+)/([^/]+)$",
+    ]
+    for pattern in patterns:
+        match = re.search(pattern, repo_url.strip())
+        if match:
+            return match.group(1), match.group(2).removesuffix(".git")
+    raise ValueError(f"Invalid GitHub repo URL: {repo_url}")
 
 
-class Citation(BaseModel):
-    """Citation attached to the final answer."""
-
-    label: str
-    source_type: Literal["docs", "github"]
-    url: str | None = None
-    excerpt: str = ""
-
-
-class ReasoningTrace(BaseModel):
-    """Full reasoning trace shown in the UI."""
-
-    route: Literal["docs", "github", "both"] = "both"
-    route_reason: str = ""
-    docs_grade: SourceGrade | None = None
-    github_grade: SourceGrade | None = None
-    ranked_evidence: list[EvidenceItem] = Field(default_factory=list)
-    conflict_detected: bool = False
-    conflict_details: list[ConflictDetail] = Field(default_factory=list)
-    reconciliation_notes: str = ""
-    self_correction_triggered: bool = False
-    self_correction_notes: str = ""
-    original_query: str = ""
-    rewritten_query: str = ""
-    retry_count: int = 0
+def _headers() -> dict[str, str]:
+    headers = {
+        "Accept": "application/vnd.github+json",
+        "X-GitHub-Api-Version": "2022-11-28",
+    }
+    token = os.getenv("GITHUB_TOKEN")
+    if token:
+        headers["Authorization"] = f"Bearer {token}"
+    return headers
 
 
-class DocChunk(BaseModel):
-    """Structured doc chunk stored in the vector DB."""
+def _get_paginated(client: httpx.Client, url: str, max_pages: int = 5) -> list[dict]:
+    items: list[dict] = []
+    page_url: str | None = url
+    pages = 0
+    while page_url and pages < max_pages:
+        resp = client.get(page_url)
+        resp.raise_for_status()
+        items.extend(resp.json())
+        page_url = resp.links.get("next", {}).get("url")
+        pages += 1
+    return items
 
-    doc_name: str
-    section: str
-    content: str
-    chunk_index: int
+
+def _format_files(files: list[dict]) -> list[str]:
+    """Turn a GitHub API `files` array into readable diff snippets."""
+    out: list[str] = []
+    for f in files[:MAX_FILES_PER_ITEM]:
+        filename = f.get("filename", "unknown")
+        status = f.get("status", "modified")
+        patch = (f.get("patch") or "")[:PATCH_CHAR_LIMIT]
+        entry = f"{filename} ({status}, +{f.get('additions', 0)}/-{f.get('deletions', 0)})"
+        if patch:
+            entry += f"\n{patch}"
+        out.append(entry)
+    return out
 
 
-class GitHubItem(BaseModel):
-    """Structured GitHub commit, PR, issue, comment, or repo file item."""
+def _fetch_commit_files(client: httpx.Client, owner: str, repo: str, sha: str) -> list[str]:
+    """Fetch the file diff for a single commit (one extra API call each)."""
+    try:
+        resp = client.get(f"{GITHUB_API}/repos/{owner}/{repo}/commits/{sha}")
+        resp.raise_for_status()
+        return _format_files(resp.json().get("files", []))
+    except httpx.HTTPError:
+        return []
 
-    item_type: Literal["commit", "pr", "issue", "comment", "file"]
-    sha: str | None = None
-    pr_number: int | None = None
-    issue_number: int | None = None
-    comment_id: int | None = None
-    file_path: str | None = None
-    title: str
-    body: str
-    author: str
-    timestamp: datetime
-    url: str
-    files_changed: list[str] = Field(default_factory=list)
+
+def _fetch_pr_files(client: httpx.Client, owner: str, repo: str, number: int) -> list[str]:
+    try:
+        resp = client.get(f"{GITHUB_API}/repos/{owner}/{repo}/pulls/{number}/files")
+        resp.raise_for_status()
+        return _format_files(resp.json())
+    except httpx.HTTPError:
+        return []
+
+
+def _fetch_comments(client: httpx.Client, owner: str, repo: str, number: int) -> list[dict]:
+    """Fetch general discussion comments on an issue or PR (PRs are issues in the GitHub API)."""
+    try:
+        url = f"{GITHUB_API}/repos/{owner}/{repo}/issues/{number}/comments?per_page={MAX_COMMENTS_PER_THREAD}"
+        resp = client.get(url)
+        resp.raise_for_status()
+        return resp.json()[:MAX_COMMENTS_PER_THREAD]
+    except httpx.HTTPError:
+        return []
+
+
+def fetch_commits(
+    client: httpx.Client, owner: str, repo: str, limit: int = MAX_COMMITS
+) -> list[GitHubItem]:
+    url = f"{GITHUB_API}/repos/{owner}/{repo}/commits?per_page=30"
+    raw = _get_paginated(client, url, max_pages=3)[:limit]
+    items: list[GitHubItem] = []
+    for i, c in enumerate(raw):
+        commit = c.get("commit", {})
+        msg = commit.get("message", "")
+        ts = commit.get("author", {}).get("date") or commit.get("committer", {}).get("date")
+        sha = c.get("sha", "")
+        files_changed = (
+            _fetch_commit_files(client, owner, repo, sha) if i < MAX_COMMITS_WITH_DIFF else []
+        )
+        items.append(
+            GitHubItem(
+                item_type="commit",
+                sha=sha,
+                title=msg.split("\n")[0][:200],
+                body=msg,
+                author=(c.get("author") or {}).get("login", "unknown"),
+                timestamp=datetime.fromisoformat(ts.replace("Z", "+00:00"))
+                if ts
+                else datetime.now(timezone.utc),
+                url=c.get("html_url", ""),
+                files_changed=files_changed,
+            )
+        )
+    return items
+
+
+def fetch_pull_requests(
+    client: httpx.Client, owner: str, repo: str, limit: int = MAX_PRS
+) -> tuple[list[GitHubItem], list[GitHubItem]]:
+    """Returns (prs, pr_comments)."""
+    url = f"{GITHUB_API}/repos/{owner}/{repo}/pulls?state=all&per_page=20"
+    raw = _get_paginated(client, url, max_pages=2)[:limit]
+    prs: list[GitHubItem] = []
+    comments: list[GitHubItem] = []
+    for pr in raw:
+        number = pr.get("number")
+        merged = pr.get("merged_at")
+        ts = merged or pr.get("created_at")
+        prs.append(
+            GitHubItem(
+                item_type="pr",
+                pr_number=number,
+                title=pr.get("title", ""),
+                body=pr.get("body") or "",
+                author=(pr.get("user") or {}).get("login", "unknown"),
+                timestamp=datetime.fromisoformat(ts.replace("Z", "+00:00"))
+                if ts
+                else datetime.now(timezone.utc),
+                url=pr.get("html_url", ""),
+                files_changed=_fetch_pr_files(client, owner, repo, number),
+            )
+        )
+        comments.extend(
+            _comments_to_items(_fetch_comments(client, owner, repo, number), pr_number=number)
+        )
+    return prs, comments
+
+
+def fetch_issues(
+    client: httpx.Client, owner: str, repo: str, limit: int = MAX_ISSUES
+) -> tuple[list[GitHubItem], list[GitHubItem]]:
+    """Returns (issues, issue_comments). Filters out PRs, which the
+    `/issues` endpoint also returns."""
+    url = f"{GITHUB_API}/repos/{owner}/{repo}/issues?state=all&per_page=30"
+    raw = _get_paginated(client, url, max_pages=3)
+    raw = [i for i in raw if "pull_request" not in i][:limit]
+
+    issues: list[GitHubItem] = []
+    comments: list[GitHubItem] = []
+    for issue in raw:
+        number = issue.get("number")
+        ts = issue.get("created_at")
+        issues.append(
+            GitHubItem(
+                item_type="issue",
+                issue_number=number,
+                title=issue.get("title", ""),
+                body=issue.get("body") or "",
+                author=(issue.get("user") or {}).get("login", "unknown"),
+                timestamp=datetime.fromisoformat(ts.replace("Z", "+00:00"))
+                if ts
+                else datetime.now(timezone.utc),
+                url=issue.get("html_url", ""),
+            )
+        )
+        comments.extend(
+            _comments_to_items(_fetch_comments(client, owner, repo, number), issue_number=number)
+        )
+    return issues, comments
+
+
+def _comments_to_items(
+    raw_comments: list[dict],
+    pr_number: int | None = None,
+    issue_number: int | None = None,
+) -> list[GitHubItem]:
+    items: list[GitHubItem] = []
+    for c in raw_comments:
+        ts = c.get("created_at")
+        body = (c.get("body") or "")[:COMMENT_CHAR_LIMIT]
+        parent = f"PR #{pr_number}" if pr_number else f"Issue #{issue_number}"
+        items.append(
+            GitHubItem(
+                item_type="comment",
+                pr_number=pr_number,
+                issue_number=issue_number,
+                comment_id=c.get("id"),
+                title=f"Comment on {parent}",
+                body=body,
+                author=(c.get("user") or {}).get("login", "unknown"),
+                timestamp=datetime.fromisoformat(ts.replace("Z", "+00:00"))
+                if ts
+                else datetime.now(timezone.utc),
+                url=c.get("html_url", ""),
+            )
+        )
+    return items
+
+
+def _get_default_branch(client: httpx.Client, owner: str, repo: str) -> str:
+    resp = client.get(f"{GITHUB_API}/repos/{owner}/{repo}")
+    resp.raise_for_status()
+    return resp.json().get("default_branch", "main")
+
+
+def fetch_repo_files(client: httpx.Client, owner: str, repo: str) -> list[GitHubItem]:
+    """Fetch actual repo file contents (README, source, docs, etc.) via the
+    Git Trees + Contents API. This is what lets the KB answer questions
+    about things that only exist as files in the repo (e.g. a README
+    describing screens/architecture), not just commit/PR/issue history."""
+    branch = _get_default_branch(client, owner, repo)
+    try:
+        resp = client.get(
+            f"{GITHUB_API}/repos/{owner}/{repo}/git/trees/{branch}?recursive=1"
+        )
+        resp.raise_for_status()
+        tree = resp.json().get("tree", [])
+    except httpx.HTTPError:
+        return []
+
+    candidates = []
+    for entry in tree:
+        if entry.get("type") != "blob":
+            continue
+        path = entry.get("path", "")
+        if any(seg in SKIP_PATH_SEGMENTS for seg in path.split("/")):
+            continue
+        ext = "." + path.rsplit(".", 1)[-1].lower() if "." in path else ""
+        if ext not in REPO_FILE_EXTENSIONS:
+            continue
+        if entry.get("size", 0) > MAX_FILE_BYTES:
+            continue
+        candidates.append(entry)
+
+    # Prioritize README and top-level docs so they're never crowded out
+    # by MAX_REPO_FILES on larger repos.
+    candidates.sort(key=lambda e: (0 if "readme" in e["path"].lower() else 1, e["path"].count("/")))
+    candidates = candidates[:MAX_REPO_FILES]
+
+    items: list[GitHubItem] = []
+    for entry in candidates:
+        path = entry["path"]
+        try:
+            resp = client.get(f"{GITHUB_API}/repos/{owner}/{repo}/contents/{path}?ref={branch}")
+            resp.raise_for_status()
+            data = resp.json()
+            if data.get("encoding") != "base64":
+                continue
+            content = base64.b64decode(data["content"]).decode("utf-8", errors="replace")
+        except (httpx.HTTPError, KeyError, ValueError):
+            continue
+
+        items.append(
+            GitHubItem(
+                item_type="file",
+                file_path=path,
+                title=path,
+                body=content,
+                author=owner,
+                timestamp=datetime.now(timezone.utc),
+                url=data.get("html_url", f"https://github.com/{owner}/{repo}/blob/{branch}/{path}"),
+            )
+        )
+    return items
+
+
+def fetch_github_history(repo_url: str) -> list[GitHubItem]:
+    """Fetch repo files (README/source/docs), commits (+diffs),
+    PRs (+diffs +comments), and issues (+comments)."""
+    owner, repo = _parse_repo_url(repo_url)
+    with httpx.Client(timeout=30.0, headers=_headers()) as client:
+        files = fetch_repo_files(client, owner, repo)
+        commits = fetch_commits(client, owner, repo)
+        prs, pr_comments = fetch_pull_requests(client, owner, repo)
+        issues, issue_comments = fetch_issues(client, owner, repo)
+    return files + commits + prs + pr_comments + issues + issue_comments
+
+
+def _item_to_document(item: GitHubItem) -> str:
+    if item.item_type == "file":
+        return f"File: {item.file_path}\n\n{item.body}"
+
+    prefix = {
+        "pr": "Pull Request",
+        "commit": "Commit",
+        "issue": "Issue",
+        "comment": "Comment",
+    }[item.item_type]
+    if item.item_type == "pr":
+        identifier = f"#{item.pr_number}"
+    elif item.item_type == "issue":
+        identifier = f"#{item.issue_number}"
+    elif item.item_type == "comment":
+        identifier = f"#{item.comment_id}"
+    else:
+        identifier = (item.sha or "")[:12]
+
+    parts = [
+        f"{prefix} {identifier}",
+        f"Title: {item.title}",
+        f"Author: {item.author}",
+        f"Date: {item.timestamp.isoformat()}",
+        f"Description:\n{item.body}",
+    ]
+    if item.files_changed:
+        parts.append("Files changed:\n" + "\n\n".join(item.files_changed))
+    return "\n".join(parts)
+
+
+def index_github_items(items: list[GitHubItem]) -> int:
+    if not items:
+        return 0
+
+    splitter = get_text_splitter()
+    ids: list[str] = []
+    documents: list[str] = []
+    metadatas: list[dict] = []
+
+    for item in items:
+        if item.item_type == "file":
+            chunks = splitter.split_text(item.body) or [item.body]
+            for idx, chunk in enumerate(chunks):
+                ids.append(f"file-{item.file_path}-{idx}")
+                documents.append(f"File: {item.file_path} (part {idx + 1}/{len(chunks)})\n\n{chunk}")
+                metadatas.append(
+                    {
+                        "source_type": "github",
+                        "item_type": "file",
+                        "file_path": item.file_path or "",
+                        "chunk_index": idx,
+                        "title": item.title,
+                        "author": item.author,
+                        "timestamp": item.timestamp.isoformat(),
+                        "url": item.url,
+                    }
+                )
+            continue
+
+        if item.item_type == "pr":
+            doc_id = f"pr-{item.pr_number}"
+        elif item.item_type == "issue":
+            doc_id = f"issue-{item.issue_number}"
+        elif item.item_type == "comment":
+            doc_id = f"comment-{item.comment_id}"
+        else:
+            doc_id = f"commit-{item.sha}"
+        ids.append(doc_id)
+        documents.append(_item_to_document(item))
+        metadatas.append(
+            {
+                "source_type": "github",
+                "item_type": item.item_type,
+                "sha": item.sha or "",
+                "pr_number": item.pr_number or 0,
+                "issue_number": item.issue_number or 0,
+                "comment_id": item.comment_id or 0,
+                "title": item.title,
+                "author": item.author,
+                "timestamp": item.timestamp.isoformat(),
+                "url": item.url,
+                "has_files": bool(item.files_changed),
+            }
+        )
+
+    add_to_collection(GITHUB_COLLECTION, ids, documents, metadatas)
+    return len(items)
