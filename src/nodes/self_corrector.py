@@ -38,7 +38,7 @@ def self_corrector_node(state: AgentState) -> dict:
         f"GitHub grade: {github_grade.confidence if github_grade else 'N/A'}"
     )
 
-    llm = get_llm(temperature=0.3)
+    llm = get_llm(temperature=0.3, fast=True)
     response = llm.invoke(
         [
             SystemMessage(content=REWRITE_SYSTEM),
