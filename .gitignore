@@ -1,0 +1,38 @@
+# Python
+*.py[cod]
+__pycache__/
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# Environment variables
+.env
+.env.*
+!.env.example
+
+# Streamlit secrets
+.streamlit/secrets.toml
+!.streamlit/secrets.toml.example
+
+# ChromaDB
+.chroma_data/
+
+# Build files
+*.egg-info/
+dist/
+build/
+
+# IDEs
+.vscode/
+.idea/
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Testing
+.pytest_cache/
+.coverage
+htmlcov/
