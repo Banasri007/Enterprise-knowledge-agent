@@ -54,6 +54,9 @@ def reset_collections() -> None:
             client.delete_collection(name)
         except (ValueError, chromadb.errors.NotFoundError):
             pass
+    from src.utils.retrieval import invalidate_retrieval_cache  # local import: avoid circular import
+
+    invalidate_retrieval_cache()
 
 
 def embed_texts(texts: list[str]) -> list[list[float]]:
@@ -75,6 +78,9 @@ def add_to_collection(
         metadatas=metadatas,
         embeddings=embeddings,
     )
+    from src.utils.retrieval import invalidate_retrieval_cache  # local import: avoid circular import
+
+    invalidate_retrieval_cache(collection_name)
 
 
 def query_collection(
