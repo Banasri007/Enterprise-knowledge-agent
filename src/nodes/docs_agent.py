@@ -10,7 +10,8 @@ from langchain_core.messages import HumanMessage, SystemMessage
 from src.models.schemas import EvidenceItem, SourceGrade
 from src.state import AgentState
 from src.utils.llm import get_llm
-from src.utils.vector_store import DOCS_COLLECTION, query_collection
+from src.utils.retrieval import hybrid_query
+from src.utils.vector_store import DOCS_COLLECTION
 
 GROUNDING_SYSTEM = """You grade whether retrieved documentation evidence can answer the question.
 Respond ONLY with JSON:
@@ -84,7 +85,7 @@ def _grade_evidence(question: str, items: list[EvidenceItem]) -> SourceGrade:
 def docs_agent_node(state: AgentState) -> dict:
     """Retrieve from docs corpus and grade grounding."""
     question = state.get("rewritten_query") or state["question"]
-    raw = query_collection(DOCS_COLLECTION, question, n_results=5)
+    raw = hybrid_query(DOCS_COLLECTION, question, n_results=5)
 
     evidence: list[EvidenceItem] = []
     for item in raw:
