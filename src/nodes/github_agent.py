@@ -11,7 +11,8 @@ from langchain_core.messages import HumanMessage, SystemMessage
 from src.models.schemas import EvidenceItem, SourceGrade
 from src.state import AgentState
 from src.utils.llm import get_llm
-from src.utils.vector_store import GITHUB_COLLECTION, query_collection
+from src.utils.retrieval import hybrid_query
+from src.utils.vector_store import GITHUB_COLLECTION
 
 GROUNDING_SYSTEM = """You grade whether retrieved GitHub commit/PR evidence can answer the question.
 Respond ONLY with JSON:
@@ -97,7 +98,7 @@ def _grade_evidence(question: str, items: list[EvidenceItem]) -> SourceGrade:
 def github_agent_node(state: AgentState) -> dict:
     """Retrieve from GitHub history and grade grounding."""
     question = state.get("rewritten_query") or state["question"]
-    raw = query_collection(GITHUB_COLLECTION, question, n_results=5)
+    raw = hybrid_query(GITHUB_COLLECTION, question, n_results=5)
 
     evidence: list[EvidenceItem] = []
     for item in raw:
