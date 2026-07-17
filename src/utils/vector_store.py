@@ -12,12 +12,11 @@ from chromadb.config import Settings
 from langchain_huggingface import HuggingFaceEmbeddings
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 
-CHROMA_DIR = Path(".chroma_data")
 DOCS_COLLECTION = "docs_corpus"
 GITHUB_COLLECTION = "github_history"
 
 
-@st.cache_resource(show_spinner="Loading embedding model (first run only)...")
+@st.cache_resource(show_spinner=False)
 def get_embeddings() -> HuggingFaceEmbeddings:
     """Local sentence-transformer embeddings (Groq has no embedding API).
 
@@ -27,17 +26,39 @@ def get_embeddings() -> HuggingFaceEmbeddings:
     silently get reloaded from disk on reruns that shouldn't have touched
     it. st.cache_resource is Streamlit's purpose-built fix for exactly
     this (models, DB connections) and survives reruns properly.
+
+    show_spinner=False: this is called from inside LangGraph node functions
+    (docs_agent_node etc.), which LangGraph runs in worker threads with no
+    Streamlit ScriptRunContext. The default spinner tries to enqueue a UI
+    message via that context and raises NoSessionContext off the main thread.
+
+    Loads from a locally bundled copy (assets/models/embedding, produced
+    by scripts/download_models.py) if present, so there's no Hugging Face
+    Hub network call at all on cold start. Falls back to the Hub model
+    name otherwise (e.g. before you've run the download script).
     """
-    model = os.getenv("EMBEDDING_MODEL", "all-MiniLM-L6-v2")
+    local_path = Path(__file__).resolve().parent.parent.parent / "assets" / "models" / "embedding"
+    model = str(local_path) if local_path.exists() else os.getenv("EMBEDDING_MODEL", "all-MiniLM-L6-v2")
     return HuggingFaceEmbeddings(model_name=model)
 
 
 @st.cache_resource
 def get_chroma_client() -> chromadb.ClientAPI:
-    """Persistent local Chroma client, cached per process."""
-    CHROMA_DIR.mkdir(parents=True, exist_ok=True)
-    return chromadb.PersistentClient(
-        path=str(CHROMA_DIR),
+    """In-memory Chroma client, cached per process (one instance for the
+    life of the Streamlit server process).
+
+    Deliberately NOT a PersistentClient: this app's actual requirement is
+    "build fresh each time I open the site, discard when I close it" — no
+    workflow needs the KB to survive a restart. An in-memory client removes
+    all disk I/O from every build (no writing embeddings/segments to disk,
+    no delete_collection()/get_or_create_collection() disk teardown-rebuild
+    in reset_collections()), which directly speeds up both first builds and
+    rebuilds. Note this still lives as long as the Streamlit *process* does —
+    closing a browser tab alone won't clear it if the server process is still
+    running, but stopping/restarting the process (the situation "closing the
+    website" maps to for local dev) does.
+    """
+    return chromadb.EphemeralClient(
         settings=Settings(anonymized_telemetry=False),
     )
 
