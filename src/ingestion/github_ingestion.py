@@ -6,8 +6,10 @@ from __future__ import annotations
 import base64
 import os
 import re
+import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timezone
+from typing import Callable
 
 import httpx
 
@@ -18,15 +20,15 @@ GITHUB_API = "https://api.github.com"
 
 # Bounds to keep ingestion time and API-rate-limit usage reasonable.
 # Raise these if you have a GITHUB_TOKEN (5000 req/hr vs 60 unauthenticated).
-MAX_COMMITS = 50
-MAX_COMMITS_WITH_DIFF = 15
-MAX_PRS = 20
-MAX_ISSUES = 30
+MAX_COMMITS = 25
+MAX_COMMITS_WITH_DIFF = 8
+MAX_PRS = 10
+MAX_ISSUES = 15
 MAX_COMMENTS_PER_THREAD = 5
 MAX_FILES_PER_ITEM = 5
 PATCH_CHAR_LIMIT = 800
 COMMENT_CHAR_LIMIT = 500
-MAX_REPO_FILES = 60
+MAX_REPO_FILES = 25
 MAX_FILE_BYTES = 40_000
 REPO_FILE_EXTENSIONS = {
     ".md", ".txt", ".rst", ".html", ".htm",
@@ -39,7 +41,7 @@ SKIP_PATH_SEGMENTS = {"node_modules", ".git", "bin", "obj", "dist", "build", ".v
 # Per-item fetches (commit diffs, PR files, comments, repo file contents) are
 # each a separate HTTP call. Running them one at a time was the main source
 # of slowness (100+ sequential round trips). This bounds how many run at once.
-MAX_WORKERS = 8
+MAX_WORKERS = 16
 
 
 class GitHubRateLimitError(RuntimeError):
@@ -398,16 +400,47 @@ def fetch_repo_files(client: httpx.Client, owner: str, repo: str) -> list[GitHub
     return [item for item in fetched if item is not None]
 
 
-def fetch_github_history(repo_url: str) -> list[GitHubItem]:
+def fetch_github_history(
+    repo_url: str, on_progress: "Callable[[str], None] | None" = None
+) -> list[GitHubItem]:
     """Fetch repo files (README/source/docs), commits (+diffs),
-    PRs (+diffs +comments), and issues (+comments)."""
+    PRs (+diffs +comments), and issues (+comments).
+
+    on_progress, if given, is called with a short status string before
+    each stage — this is what lets the UI show which stage is actually
+    slow instead of a single opaque spinner for the whole thing.
+    """
     owner, repo = _parse_repo_url(repo_url)
+
+    def _report(msg: str) -> None:
+        if on_progress:
+            on_progress(msg)
+
     with httpx.Client(timeout=30.0, headers=_headers()) as client:
         _check_rate_limit(client)
+
+        _report("Fetching repo files...")
+        t0 = time.monotonic()
         files = fetch_repo_files(client, owner, repo)
+        _report(f"Repo files: {len(files)} in {time.monotonic() - t0:.1f}s")
+
+        _report("Fetching commits...")
+        t0 = time.monotonic()
         commits = fetch_commits(client, owner, repo)
+        _report(f"Commits: {len(commits)} in {time.monotonic() - t0:.1f}s")
+
+        _report("Fetching pull requests...")
+        t0 = time.monotonic()
         prs, pr_comments = fetch_pull_requests(client, owner, repo)
+        _report(f"PRs: {len(prs)} (+{len(pr_comments)} comments) in {time.monotonic() - t0:.1f}s")
+
+        _report("Fetching issues...")
+        t0 = time.monotonic()
         issues, issue_comments = fetch_issues(client, owner, repo)
+        _report(
+            f"Issues: {len(issues)} (+{len(issue_comments)} comments) in {time.monotonic() - t0:.1f}s"
+        )
+
     return files + commits + prs + pr_comments + issues + issue_comments
 
 
