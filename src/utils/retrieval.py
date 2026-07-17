@@ -23,8 +23,10 @@ from __future__ import annotations
 import hashlib
 from collections import OrderedDict
 from functools import lru_cache
+from pathlib import Path
 from typing import Any
 
+import streamlit as st
 from langchain_chroma import Chroma
 from langchain_classic.retrievers import EnsembleRetriever
 from langchain_classic.retrievers.multi_query import MultiQueryRetriever
@@ -56,14 +58,36 @@ _retrieval_cache: "OrderedDict[str, list[dict[str, Any]]]" = OrderedDict()
 _collection_versions: dict[str, int] = {}
 
 
-@lru_cache(maxsize=1)
+@st.cache_resource(show_spinner=False)
 def get_reranker() -> CrossEncoder:
-    """Cross-encoder reranker model, loaded once per process."""
-    return CrossEncoder(RERANK_MODEL)
+    """Cross-encoder reranker model, loaded once per process.
+
+    Uses st.cache_resource instead of functools.lru_cache for the same
+    reason as get_embeddings() in vector_store.py: a plain lru_cache isn't
+    reliably preserved across Streamlit's rerun/file-watcher cycle, so this
+    model could silently reload on reruns that shouldn't have touched it.
+
+    show_spinner=False: this is called from inside LangGraph node functions,
+    which LangGraph runs in worker threads (ThreadPoolExecutor) with no
+    Streamlit ScriptRunContext. st.cache_resource's default spinner tries to
+    enqueue a UI message via that context and raises NoSessionContext when
+    called off the main thread, so the spinner must stay off here.
+
+    Loads from a locally bundled copy (assets/models/reranker, produced by
+    scripts/download_models.py) if present, avoiding a Hugging Face Hub
+    network call on cold start. Falls back to the Hub model name otherwise.
+    """
+    local_path = Path(__file__).resolve().parent.parent.parent / "assets" / "models" / "reranker"
+    model = str(local_path) if local_path.exists() else RERANK_MODEL
+    return CrossEncoder(model)
 
 
-@lru_cache(maxsize=8)
-def _get_vectorstore(collection_name: str) -> Chroma:
+@lru_cache(maxsize=16)
+def _get_vectorstore(collection_name: str, version: int) -> Chroma:
+    """`version` is part of the cache key purely so invalidate_retrieval_cache()
+    can force a fresh Chroma wrapper after reset_collections() deletes and
+    recreates the underlying collection — otherwise this stayed bound to the
+    now-deleted collection object and rebuilt knowledge bases appeared empty."""
     return Chroma(
         client=get_chroma_client(),
         collection_name=collection_name,
@@ -111,11 +135,11 @@ def invalidate_retrieval_cache(collection_name: str | None = None) -> None:
 
 
 def _build_retriever(collection_name: str):
-    vector_retriever = _get_vectorstore(collection_name).as_retriever(
+    version = _collection_versions.get(collection_name, 0)
+    vector_retriever = _get_vectorstore(collection_name, version).as_retriever(
         search_type="mmr",
         search_kwargs={"k": MMR_K, "fetch_k": MMR_FETCH_K, "lambda_mult": MMR_LAMBDA},
     )
-    version = _collection_versions.get(collection_name, 0)
     bm25_retriever = _get_bm25_retriever(collection_name, version)
 
     hybrid = (
