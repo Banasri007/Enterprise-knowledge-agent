@@ -39,7 +39,14 @@ def get_embeddings() -> HuggingFaceEmbeddings:
     """
     local_path = Path(__file__).resolve().parent.parent.parent / "assets" / "models" / "embedding"
     model = str(local_path) if local_path.exists() else os.getenv("EMBEDDING_MODEL", "all-MiniLM-L6-v2")
-    return HuggingFaceEmbeddings(model_name=model)
+    return HuggingFaceEmbeddings(
+        model_name=model,
+        # Default sentence-transformers batch_size is 32, which under-uses
+        # available CPU cores when embedding hundreds of short chunks (e.g.
+        # GitHub repo file chunks) — larger batches cut per-batch Python/
+        # tensor-setup overhead and measurably speed up bulk indexing.
+        encode_kwargs={"batch_size": 128},
+    )
 
 
 @st.cache_resource
@@ -63,10 +70,10 @@ def get_chroma_client() -> chromadb.ClientAPI:
     )
 
 
-def get_text_splitter() -> RecursiveCharacterTextSplitter:
+def get_text_splitter(chunk_size: int = 800, chunk_overlap: int = 120) -> RecursiveCharacterTextSplitter:
     return RecursiveCharacterTextSplitter(
-        chunk_size=800,
-        chunk_overlap=120,
+        chunk_size=chunk_size,
+        chunk_overlap=chunk_overlap,
         separators=["\n## ", "\n### ", "\n\n", "\n", " "],
     )
 
