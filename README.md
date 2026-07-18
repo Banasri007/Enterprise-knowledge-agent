@@ -20,6 +20,8 @@ Question → Planner → [Docs Agent | GitHub Agent] → Evidence Ranker
 
 > **Note on the planner:** in practice, the planner routes to `both` sources for nearly every real question — the two-source demo scenario is designed so most questions genuinely need both. The "Planner Routing" panel was removed from the Chat UI's reasoning trace for this reason; the node itself is unchanged in `src/graph.py` and still runs, it just wasn't informative to show when the outcome barely varies.
 
+> Live website URL : https://enterprise-knowledge-agent.streamlit.app
+
 ## Quick Start (Local)
 
 ```bash
