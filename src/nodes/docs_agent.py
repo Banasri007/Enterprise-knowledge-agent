@@ -100,14 +100,25 @@ def docs_agent_node(state: AgentState) -> dict:
 
     grade = _grade_evidence(question, evidence)
 
-    # Filter out poorly grounded items
-    filtered = [
-        e
-        for e in evidence
-        if e.grounding_score >= 0.3 or e.vector_score >= 0.5
-    ] if grade.is_grounded else []
+    if grade.is_grounded:
+        # Per-item filter within an already-grounded source: drop only the
+        # individual weak items, and if that empties the list (grading was
+        # stricter than the vector scores warranted), fall back to the
+        # full graded set rather than nothing — this fallback is safe here
+        # because the source-level grade already said "grounded".
+        filtered = [
+            e for e in evidence if e.grounding_score >= 0.3 or e.vector_score >= 0.5
+        ]
+        docs_evidence = filtered or evidence
+    else:
+        # Source-level grade says this isn't relevant/grounded at all —
+        # exclude it entirely. Previously "filtered or evidence" fell back
+        # to the full ungraded evidence here too (empty list is falsy in
+        # Python), silently undoing the grounding check and letting
+        # irrelevant retrieved chunks leak into the final answer.
+        docs_evidence = []
 
     return {
-        "docs_evidence": filtered or evidence,
+        "docs_evidence": docs_evidence,
         "docs_grade": grade,
     }
