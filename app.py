@@ -13,10 +13,19 @@ load_dotenv(override=True)
 CORPUS_DIR = Path(__file__).parent / "docs" / "corpus"
 SAMPLE_REPO_URL = "https://github.com/acme-corp/nexus-integration-hub"
 
-# Monochrome visual language: docs vs GitHub is distinguished by weight/style
-# (solid vs dashed border, pill treatment), not hue.
-WHITE = "#F2F2F2"
-GRAY = "#9A9A9A"
+# If models were pre-downloaded via scripts/download_models.py, force fully
+# offline mode so HuggingFace/sentence-transformers skip their normal "check
+# the Hub for a newer version" network round-trip on every load — this can
+# shave real seconds off cold start even when the model itself is cached
+# locally, since a cache hit still normally involves a HEAD request first.
+_ASSETS_DIR = Path(__file__).parent / "assets" / "models"
+if (_ASSETS_DIR / "embedding").exists() and (_ASSETS_DIR / "reranker").exists():
+    os.environ.setdefault("HF_HUB_OFFLINE", "1")
+    os.environ.setdefault("TRANSFORMERS_OFFLINE", "1")
+# Quiets a harmless tokenizer fork warning that otherwise gets printed (not
+# a real slowdown, but noise during timing/debugging).
+os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
+
 
 st.set_page_config(
     page_title="Enterprise Knowledge Agent",
@@ -24,6 +33,11 @@ st.set_page_config(
     layout="wide",
     initial_sidebar_state="collapsed",
 )
+
+# Monochrome visual language: docs vs GitHub is distinguished by weight/style
+# (solid vs dashed border, pill treatment), not hue.
+WHITE = "#F2F2F2"
+GRAY = "#9A9A9A"
 
 st.markdown(
     """
@@ -344,11 +358,54 @@ if page == "Setup":
             st.error("GROQ_API_KEY is required. Copy `.env.example` to `.env` and add your key.")
             st.stop()
 
-        # Show feedback before the slow part: importing chromadb/transformers/
-        # sentence-transformers can take 20-40s the first time in a process,
-        # and used to happen silently before the progress bar even existed.
-        progress = st.progress(0, text="Loading libraries (first run only)...")
+        import time
 
+        build_start = time.time()
+        timings: dict[str, float] = {}
+        progress = st.progress(0, text="Starting build...")
+        timing_box = st.empty()
+
+        def _render_timings(final_total: float | None = None) -> None:
+            lines = [f"- {name}: **{dur:.1f}s**" for name, dur in timings.items()]
+            if final_total is not None:
+                lines.append(f"\n**Total build time: {final_total:.1f}s**")
+            timing_box.markdown("\n".join(lines))
+
+        def _step(step_name: str, progress_pct: int, progress_text: str, fn, *args, **kwargs):
+            """Run fn, time it, log it into the running timing display, advance the bar."""
+            progress.progress(progress_pct, text=progress_text)
+            t0 = time.time()
+            result = fn(*args, **kwargs)
+            timings[step_name] = time.time() - t0
+            _render_timings()
+            return result
+
+        def _timed_import(step_name: str, import_fn) -> None:
+            t0 = time.time()
+            import_fn()
+            timings[step_name] = time.time() - t0
+            _render_timings()
+
+        # Broken out per-library (matching scripts/diagnose_startup.py
+        # exactly) instead of one lumped "imports" bucket, so we can see
+        # inside the real Streamlit process which specific import — if
+        # any — is disproportionately slower than the same import
+        # standalone. sys.modules caching means only the FIRST of these
+        # to touch a given heavy library pays its real cost; the rest
+        # are near-instant lookups.
+        _timed_import("import_torch", lambda: __import__("torch"))
+        _timed_import("import_transformers", lambda: __import__("transformers"))
+        _timed_import("import_sentence_transformers", lambda: __import__("sentence_transformers"))
+        _timed_import("import_chromadb", lambda: __import__("chromadb"))
+        _timed_import("import_langchain_classic", lambda: __import__("langchain_classic"))
+        _timed_import("import_langchain_huggingface", lambda: __import__("langchain_huggingface"))
+        _timed_import("import_langchain_chroma", lambda: __import__("langchain_chroma"))
+        _timed_import("import_pypdf", lambda: __import__("pypdf"))
+        _timed_import("import_httpx", lambda: __import__("httpx"))
+        _timed_import("import_pygithub", lambda: __import__("github"))
+        _timed_import("import_langgraph", lambda: __import__("langgraph"))
+
+        t0 = time.time()
         from src.ingestion.docs_ingestion import (
             index_doc_chunks,
             ingest_doc_bytes,
@@ -357,20 +414,32 @@ if page == "Setup":
         from src.ingestion.github_ingestion import fetch_github_history, index_github_items
         from src.ingestion.sample_data import load_sample_github_items
         from src.utils.vector_store import reset_collections
+        timings["local_module_imports"] = time.time() - t0
+        _render_timings()
 
-        progress.progress(5, text="Resetting vector store...")
-        reset_collections()
+        _step("reset_vector_store", 10, "Resetting vector store...", reset_collections)
 
-        progress.progress(10, text="Loading embedding model (first run only, ~1-2 min)...")
-        from src.utils.vector_store import get_embeddings
+        def _load_models():
+            from src.utils.retrieval import get_reranker
+            from src.utils.vector_store import get_embeddings
 
-        get_embeddings()  # force load/download now so it's not hidden inside chunk indexing below
+            get_embeddings()
+            get_reranker()
+
+        _step(
+            "load_models", 15,
+            "Loading embedding + reranker models (first run only)...",
+            _load_models,
+        )
+
+        if not use_sample and not uploaded_files and not repo_url:
+            st.error("Provide a GitHub repo URL, upload at least one doc file, or enable sample data.")
+            st.stop()
 
         progress.progress(25, text="Processing documents...")
-
+        t0 = time.time()
         doc_chunks = []
         doc_file_count = 0
-
         if use_sample:
             if not CORPUS_DIR.exists() or not list(CORPUS_DIR.glob("*.pdf")):
                 from scripts.generate_corpus_pdfs import main as generate_pdfs
@@ -382,31 +451,38 @@ if page == "Setup":
             for f in uploaded_files:
                 doc_chunks.extend(ingest_doc_bytes(f.name, f.read()))
                 doc_file_count += 1
-        else:
-            st.error("Upload at least one doc file, or enable sample data.")
-            st.stop()
+        # else: no docs provided and that's fine — just skip docs entirely,
+        # as long as GitHub was provided (checked above).
+        timings["process_documents"] = time.time() - t0
+        _render_timings()
 
-        chunk_count = index_doc_chunks(doc_chunks)
-        progress.progress(40, text="Fetching GitHub history...")
+        chunk_count = _step(
+            "index_doc_chunks", 45, "Indexing document chunks...",
+            lambda: index_doc_chunks(doc_chunks) if doc_chunks else 0,
+        )
 
         github_items = []
         if use_sample:
-            github_items = load_sample_github_items()
+            github_items = _step(
+                "fetch_github_history", 60, "Loading sample GitHub history...",
+                load_sample_github_items,
+            )
         elif repo_url:
             try:
-                github_items = fetch_github_history(
-                    repo_url,
-                    on_progress=lambda msg: progress.progress(40, text=f"GitHub: {msg}"),
+                github_items = _step(
+                    "fetch_github_history", 60, "Fetching GitHub history...",
+                    fetch_github_history, repo_url,
+                    on_progress=lambda msg: progress.progress(60, text=f"GitHub: {msg}"),
                 )
             except Exception as exc:
                 st.error(f"GitHub fetch failed: {exc}")
                 st.stop()
-        else:
-            st.error("Provide a GitHub repo URL, or enable sample data.")
-            st.stop()
+        # else: no repo URL provided and that's fine — docs-only build.
 
-        github_count = index_github_items(github_items)
-        progress.progress(90, text="Finalizing...")
+        github_count = _step(
+            "index_github_items", 90, "Indexing GitHub history...",
+            lambda: index_github_items(github_items) if github_items else 0,
+        )
 
         commit_count = sum(1 for i in github_items if i.item_type == "commit")
         pr_count = sum(1 for i in github_items if i.item_type == "pr")
@@ -422,6 +498,7 @@ if page == "Setup":
             "repo_url": SAMPLE_REPO_URL if use_sample else repo_url,
         }
         progress.progress(100, text="Done!")
+        _render_timings(final_total=time.time() - build_start)
         st.success(
             f"Indexed **{commit_count}** commits, **{pr_count}** PRs, "
             f"**{doc_file_count}** PDF documents (**{chunk_count}** chunks)"
