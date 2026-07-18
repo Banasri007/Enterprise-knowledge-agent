@@ -479,14 +479,18 @@ def index_github_items(items: list[GitHubItem]) -> int:
     if not items:
         return 0
 
-    splitter = get_text_splitter()
+    # Larger chunk size than the doc-prose default (800): repo file content
+    # (code, config, markdown) doesn't need PDF-level fine granularity, and
+    # roughly halving the chunk count here directly cuts embedding time on
+    # what's usually the slowest step of a build.
+    file_splitter = get_text_splitter(chunk_size=1500, chunk_overlap=150)
     ids: list[str] = []
     documents: list[str] = []
     metadatas: list[dict] = []
 
     for item in items:
         if item.item_type == "file":
-            chunks = splitter.split_text(item.body) or [item.body]
+            chunks = file_splitter.split_text(item.body) or [item.body]
             for idx, chunk in enumerate(chunks):
                 ids.append(f"file-{item.file_path}-{idx}")
                 documents.append(f"File: {item.file_path} (part {idx + 1}/{len(chunks)})\n\n{chunk}")
