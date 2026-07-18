@@ -116,13 +116,15 @@ def github_agent_node(state: AgentState) -> dict:
 
     grade = _grade_evidence(question, evidence)
 
-    filtered = [
-        e
-        for e in evidence
-        if e.grounding_score >= 0.3 or e.vector_score >= 0.5
-    ] if grade.is_grounded else []
+    if grade.is_grounded:
+        filtered = [
+            e for e in evidence if e.grounding_score >= 0.3 or e.vector_score >= 0.5
+        ]
+        github_evidence = filtered or evidence
+    else:
+        github_evidence = []
 
     return {
-        "github_evidence": filtered or evidence,
+        "github_evidence": github_evidence,
         "github_grade": grade,
     }
