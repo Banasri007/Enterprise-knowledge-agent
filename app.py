@@ -13,18 +13,16 @@ load_dotenv(override=True)
 CORPUS_DIR = Path(__file__).parent / "docs" / "corpus"
 SAMPLE_REPO_URL = "https://github.com/acme-corp/nexus-integration-hub"
 
-# Visual language: two accent colors carry meaning throughout the app —
-# indigo always means "from documentation", copper always means "from
-# GitHub history". This isn't decoration, it's the same distinction the
-# agent itself reasons about, made visible.
-INDIGO = "#7C8CFF"
-COPPER = "#E8A15C"
+# Monochrome visual language: docs vs GitHub is distinguished by weight/style
+# (solid vs dashed border, pill treatment), not hue.
+WHITE = "#F2F2F2"
+GRAY = "#9A9A9A"
 
 st.set_page_config(
     page_title="Enterprise Knowledge Agent",
     page_icon="◆",
     layout="wide",
-    initial_sidebar_state="expanded",
+    initial_sidebar_state="collapsed",
 )
 
 st.markdown(
@@ -33,16 +31,16 @@ st.markdown(
     @import url('https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@400;500;600;700&family=Inter:wght@400;500;600&family=JetBrains+Mono:wght@400;500&display=swap');
 
     :root {
-        --bg-deep: #0A0E1A;
-        --bg-surface: #10162A;
-        --bg-surface-2: #161D36;
-        --indigo: #7C8CFF;
-        --indigo-dim: rgba(124, 140, 255, 0.14);
-        --copper: #E8A15C;
-        --copper-dim: rgba(232, 161, 92, 0.14);
-        --text-primary: #E9ECF7;
-        --text-muted: #8891B5;
-        --border-subtle: rgba(255, 255, 255, 0.07);
+        --bg-deep: #050505;
+        --bg-surface: #131313;
+        --bg-surface-2: #1B1B1B;
+        --white: #F2F2F2;
+        --white-dim: rgba(242, 242, 242, 0.12);
+        --gray: #9A9A9A;
+        --gray-dim: rgba(154, 154, 154, 0.14);
+        --text-primary: #F2F2F2;
+        --text-muted: #8C8C8C;
+        --border-subtle: rgba(255, 255, 255, 0.09);
     }
 
     html, body, [class*="css"] { font-family: 'Inter', sans-serif; }
@@ -54,24 +52,30 @@ st.markdown(
         font-family: 'JetBrains Mono', monospace !important;
     }
 
-    /* Ambient drifting gradient mesh — slow, quiet parallax-style motion */
+    /* Ambient background: a faint slow-drifting diagonal scanline texture,
+       pure grayscale, quiet enough to sit behind text without competing */
     .stApp {
         background:
-            radial-gradient(circle at 15% 20%, rgba(124,140,255,0.10) 0%, transparent 40%),
-            radial-gradient(circle at 85% 75%, rgba(232,161,92,0.08) 0%, transparent 45%),
-            radial-gradient(circle at 50% 100%, rgba(124,140,255,0.05) 0%, transparent 50%),
+            repeating-linear-gradient(
+                115deg,
+                rgba(255,255,255,0.025) 0px,
+                rgba(255,255,255,0.025) 1px,
+                transparent 1px,
+                transparent 68px
+            ),
+            radial-gradient(circle at 50% 0%, rgba(255,255,255,0.05) 0%, transparent 55%),
             var(--bg-deep);
-        background-size: 200% 200%;
-        animation: drift 32s ease-in-out infinite;
+        background-size: 140% 140%, 160% 160%, 100% 100%;
+        animation: drift 40s ease-in-out infinite;
     }
     @keyframes drift {
-        0%, 100% { background-position: 0% 0%, 100% 100%, 50% 100%; }
-        50% { background-position: 8% 12%, 92% 88%, 55% 92%; }
+        0%, 100% { background-position: 0% 0%, 30% 20%, 0 0; }
+        50% { background-position: -6% 4%, 38% 30%, 0 0; }
     }
 
     /* Sidebar as a glass panel */
     [data-testid="stSidebar"] {
-        background: rgba(16, 22, 42, 0.85);
+        background: rgba(19, 19, 19, 0.9);
         backdrop-filter: blur(12px);
         border-right: 1px solid var(--border-subtle);
     }
@@ -85,18 +89,18 @@ st.markdown(
 
     /* Buttons */
     .stButton > button {
-        background: linear-gradient(135deg, var(--indigo), #5B6BEE);
-        color: #0A0E1A;
+        background: var(--white);
+        color: #0A0A0A;
         font-weight: 600;
         border: none;
         border-radius: 10px;
         padding: 0.6rem 1.2rem;
-        transition: transform 0.15s ease, box-shadow 0.15s ease;
-        box-shadow: 0 2px 12px rgba(124, 140, 255, 0.25);
+        transition: transform 0.15s ease, box-shadow 0.15s ease, background 0.15s ease;
+        box-shadow: 0 2px 14px rgba(255, 255, 255, 0.12);
     }
     .stButton > button:hover {
         transform: translateY(-2px);
-        box-shadow: 0 6px 20px rgba(124, 140, 255, 0.4);
+        box-shadow: 0 6px 22px rgba(255, 255, 255, 0.22);
     }
     .stButton > button:active { transform: translateY(0px); }
 
@@ -110,7 +114,7 @@ st.markdown(
     }
     [data-testid="stMetric"]:hover {
         transform: translateY(-3px);
-        border-color: rgba(124, 140, 255, 0.35);
+        border-color: rgba(255, 255, 255, 0.3);
     }
 
     /* Expanders as quiet glass cards */
@@ -131,7 +135,7 @@ st.markdown(
 
     /* Progress bar shimmer */
     [data-testid="stProgressBar"] > div > div {
-        background: linear-gradient(90deg, var(--indigo), var(--copper), var(--indigo));
+        background: linear-gradient(90deg, #4A4A4A, var(--white), #4A4A4A);
         background-size: 200% 100%;
         animation: shimmer 1.6s linear infinite;
     }
@@ -140,18 +144,15 @@ st.markdown(
         100% { background-position: 200% 0%; }
     }
 
-    /* Radio nav rendered as pill tabs */
-    [data-testid="stSidebar"] [role="radiogroup"] { gap: 0.4rem; }
-
     /* Scrollbar */
     ::-webkit-scrollbar { width: 8px; height: 8px; }
     ::-webkit-scrollbar-track { background: transparent; }
-    ::-webkit-scrollbar-thumb { background: rgba(124,140,255,0.25); border-radius: 8px; }
+    ::-webkit-scrollbar-thumb { background: rgba(255,255,255,0.2); border-radius: 8px; }
 
     .evidence-card {
         background: var(--bg-surface);
         border: 1px solid var(--border-subtle);
-        border-left: 3px solid var(--card-accent, var(--indigo));
+        border-left: 3px solid var(--card-accent, var(--white));
         border-radius: 10px;
         padding: 0.85rem 1rem;
         margin-bottom: 0.6rem;
@@ -168,8 +169,31 @@ st.markdown(
         font-weight: 500;
         letter-spacing: 0.02em;
     }
-    .pill-docs { background: var(--indigo-dim); color: var(--indigo); }
-    .pill-github { background: var(--copper-dim); color: var(--copper); }
+    .pill-docs { background: var(--white-dim); color: var(--white); border: 1px solid rgba(255,255,255,0.25); }
+    .pill-github { background: transparent; color: var(--gray); border: 1px dashed rgba(255,255,255,0.3); }
+
+    /* Top nav tab-cards */
+    div[data-testid="column"] .stButton > button {
+        height: 64px;
+        font-family: 'Space Grotesk', sans-serif;
+        font-size: 1rem;
+        border-radius: 14px;
+    }
+    div[data-testid="column"] .stButton > button[kind="secondary"] {
+        background: var(--bg-surface);
+        color: var(--text-muted);
+        border: 1px solid var(--border-subtle);
+        box-shadow: none;
+    }
+    div[data-testid="column"] .stButton > button[kind="secondary"]:hover {
+        border-color: rgba(255, 255, 255, 0.4);
+        color: var(--text-primary);
+        transform: translateY(-2px);
+    }
+    div[data-testid="column"] .stButton > button[kind="primary"] {
+        background: var(--white);
+        box-shadow: 0 4px 24px rgba(255, 255, 255, 0.25);
+    }
     </style>
     """,
     unsafe_allow_html=True,
@@ -177,46 +201,40 @@ st.markdown(
 
 
 def _signature_header() -> None:
-    """The one intentional visual flourish: two threads — documentation
-    (indigo) and GitHub history (copper) — draw themselves in from
-    opposite sides and converge at a single glowing point. That
-    convergence is literally what this agent does to every question."""
+    """Signature visual: a radar sweep continuously scanning a field of
+    pulsing rings that converge on a single core — evidence arriving from
+    all directions and resolving to one point, rendered in monochrome."""
+    html = (
+        '<div style="position:relative;height:96px;margin-bottom:0.5rem;'
+        'display:flex;align-items:center;justify-content:center;">'
+        '<svg width="220" height="96" viewBox="0 0 220 96">'
+        '<defs><radialGradient id="sweepGrad" cx="0%" cy="50%" r="100%">'
+        '<stop offset="0%" stop-color="#F2F2F2" stop-opacity="0.55"/>'
+        '<stop offset="100%" stop-color="#F2F2F2" stop-opacity="0"/>'
+        '</radialGradient></defs>'
+        '<circle cx="110" cy="48" r="18" fill="none" stroke="rgba(255,255,255,0.14)" stroke-width="1"/>'
+        '<circle cx="110" cy="48" r="32" fill="none" stroke="rgba(255,255,255,0.10)" stroke-width="1"/>'
+        '<circle cx="110" cy="48" r="45" fill="none" stroke="rgba(255,255,255,0.06)" stroke-width="1"/>'
+        '<circle cx="110" cy="48" r="8" fill="none" stroke="#F2F2F2" stroke-width="1.4" opacity="0.7">'
+        '<animate attributeName="r" values="8;45" dur="2.6s" repeatCount="indefinite"/>'
+        '<animate attributeName="opacity" values="0.7;0" dur="2.6s" repeatCount="indefinite"/>'
+        '</circle>'
+        '<circle cx="110" cy="48" r="8" fill="none" stroke="#F2F2F2" stroke-width="1.4" opacity="0.7">'
+        '<animate attributeName="r" values="8;45" dur="2.6s" begin="1.3s" repeatCount="indefinite"/>'
+        '<animate attributeName="opacity" values="0.7;0" dur="2.6s" begin="1.3s" repeatCount="indefinite"/>'
+        '</circle>'
+        '<g transform-origin="110 48">'
+        '<path d="M 110 48 L 110 3 A 45 45 0 0 1 141.8 16.2 Z" fill="url(#sweepGrad)"/>'
+        '<animateTransform attributeName="transform" type="rotate" '
+        'from="0 110 48" to="360 110 48" dur="3.2s" repeatCount="indefinite"/>'
+        '</g>'
+        '<circle cx="110" cy="48" r="4.5" fill="#F2F2F2">'
+        '<animate attributeName="r" values="4;5.5;4" dur="1.8s" repeatCount="indefinite"/>'
+        '</circle>'
+        '</svg></div>'
+    )
     st.markdown(
-        """
-        <div style="position: relative; height: 92px; margin-bottom: 0.5rem;">
-            <svg width="100%" height="92" viewBox="0 0 900 92" preserveAspectRatio="none"
-                 style="position:absolute; top:0; left:0;">
-                <defs>
-                    <linearGradient id="gIndigo" x1="0" y1="0" x2="1" y2="0">
-                        <stop offset="0%" stop-color="#7C8CFF" stop-opacity="0"/>
-                        <stop offset="100%" stop-color="#7C8CFF" stop-opacity="1"/>
-                    </linearGradient>
-                    <linearGradient id="gCopper" x1="1" y1="0" x2="0" y2="0">
-                        <stop offset="0%" stop-color="#E8A15C" stop-opacity="0"/>
-                        <stop offset="100%" stop-color="#E8A15C" stop-opacity="1"/>
-                    </linearGradient>
-                </defs>
-                <path d="M0,26 C 220,26 320,46 450,46" stroke="url(#gIndigo)" stroke-width="2.5"
-                      fill="none" stroke-dasharray="480" stroke-dashoffset="480">
-                    <animate attributeName="stroke-dashoffset" from="480" to="0" dur="1.1s"
-                             fill="freeze" calcMode="spline" keySplines="0.16,1,0.3,1"/>
-                </path>
-                <path d="M900,66 C 680,66 580,46 450,46" stroke="url(#gCopper)" stroke-width="2.5"
-                      fill="none" stroke-dasharray="480" stroke-dashoffset="480">
-                    <animate attributeName="stroke-dashoffset" from="480" to="0" dur="1.1s"
-                             fill="freeze" calcMode="spline" keySplines="0.16,1,0.3,1"/>
-                </path>
-                <circle cx="450" cy="46" r="5" fill="#E9ECF7">
-                    <animate attributeName="r" values="4;7;4" dur="2.4s" repeatCount="indefinite"/>
-                    <animate attributeName="opacity" values="0;1" dur="0.4s" begin="1.0s" fill="freeze"/>
-                </circle>
-                <circle cx="450" cy="46" r="14" fill="none" stroke="#E9ECF7" stroke-width="1" opacity="0">
-                    <animate attributeName="r" values="6;22" dur="2.4s" repeatCount="indefinite"/>
-                    <animate attributeName="opacity" values="0.5;0" dur="2.4s" repeatCount="indefinite"/>
-                </circle>
-            </svg>
-        </div>
-        """,
+        html,
         unsafe_allow_html=True,
     )
 
@@ -237,25 +255,51 @@ def _check_api_key() -> bool:
     return bool(key and not key.startswith("gsk_your"))
 
 
-# --- Sidebar navigation ---
-st.sidebar.markdown(
+if "page" not in st.session_state:
+    st.session_state.page = "Setup"
+
+# --- Top nav: title + two tab-cards (replaces sidebar) ---
+st.markdown(
     """
-    <div style="font-family:'Space Grotesk',sans-serif; font-weight:700; font-size:1.3rem;
-                letter-spacing:-0.02em; margin-bottom:0.1rem;">
-        <span style="color:#7C8CFF;">◆</span> Enterprise Knowledge Agent
-    </div>
-    <div style="color:#8891B5; font-size:0.82rem; margin-bottom:1rem;">
-        Acme Corp · Nexus Integration Hub demo
+    <div style="display:flex; align-items:baseline; gap:0.6rem; margin-bottom:0.9rem;">
+        <span style="font-family:'Space Grotesk',sans-serif; font-weight:700; font-size:1.7rem;
+                     letter-spacing:-0.02em; color:#F2F2F2;">
+            <span style="color:#F2F2F2;">◆</span> Enterprise Knowledge Agent
+        </span>
+        <span style="color:#8C8C8C; font-size:0.88rem;">Acme Corp · Nexus Integration Hub demo</span>
     </div>
     """,
     unsafe_allow_html=True,
 )
-page = st.sidebar.radio("Navigate", ["Setup", "Chat"], index=0 if not st.session_state.kb_built else 1)
 
-st.sidebar.markdown("---")
+nav_col1, nav_col2 = st.columns(2, gap="medium")
+with nav_col1:
+    setup_active = st.session_state.page == "Setup"
+    if st.button(
+        ("◆ " if setup_active else "") + "Setup — Build Knowledge Base",
+        key="nav_setup",
+        use_container_width=True,
+        type="primary" if setup_active else "secondary",
+    ):
+        st.session_state.page = "Setup"
+        st.rerun()
+with nav_col2:
+    chat_active = st.session_state.page == "Chat"
+    if st.button(
+        ("◆ " if chat_active else "") + "Chat — Ask the Agent",
+        key="nav_chat",
+        use_container_width=True,
+        type="primary" if chat_active else "secondary",
+    ):
+        st.session_state.page = "Chat"
+        st.rerun()
+
+page = st.session_state.page
 
 if not _check_api_key():
-    st.sidebar.warning("Set GROQ_API_KEY in `.env` or Streamlit secrets.")
+    st.warning("Set GROQ_API_KEY in `.env` or Streamlit secrets.")
+
+st.markdown("<div style='height:0.4rem;'></div>", unsafe_allow_html=True)
 
 
 # ====================================================================
@@ -368,6 +412,7 @@ if page == "Setup":
         pr_count = sum(1 for i in github_items if i.item_type == "pr")
 
         st.session_state.kb_built = True
+        st.session_state.page = "Chat"
         st.session_state.kb_stats = {
             "commits": commit_count,
             "prs": pr_count,
@@ -488,7 +533,7 @@ elif page == "Chat":
                     label = ev.citation_label
                     url = ev.citation_url
                     is_docs = ev.source_type == "docs"
-                    accent = INDIGO if is_docs else COPPER
+                    accent = WHITE if is_docs else GRAY
                     pill_class = "pill-docs" if is_docs else "pill-github"
                     pill_text = "DOCS" if is_docs else "GITHUB"
                     title_html = f'<a href="{url}" target="_blank" style="color:inherit;">{label}</a>' if url else label
